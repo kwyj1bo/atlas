@@ -279,6 +279,26 @@ class TestCentralReport(IntegrationTestCase):
 		self.assertEqual(stamp.call_args.kwargs["status"], "error")
 		self.assertEqual(stamp.call_args.kwargs["http_status"], 503)
 
+	def test_deliver_with_retry_false_makes_exactly_one_attempt(self) -> None:
+		# retry_pending's batch sweep passes retry=False so one slow-failing row
+		# can't burn the whole batch job's shared timeout budget on 7 attempts of
+		# backoff — this is the fix for that. Prove it directly: a single failure,
+		# no sleep, one stamp, done.
+		settings = MagicMock()
+		settings.enabled = 1
+		settings.api_key = "svc_key"
+		settings.client.return_value.post_event.side_effect = CentralError("central down", 503)
+		with (
+			patch.object(central_report.frappe, "get_single", return_value=settings),
+			patch.object(central_report, "_stamp") as stamp,
+			patch.object(central_report.frappe, "log_error"),
+			patch.object(central_report.time, "sleep") as sleep,
+		):
+			central_report.deliver("cel-1", "vm.created", {"name": "vm-1"}, retry=False)
+		self.assertEqual(settings.client.return_value.post_event.call_count, 1)
+		sleep.assert_not_called()
+		stamp.assert_called_once_with("cel-1", status="error", last_error="central down", http_status=503)
+
 	def test_deliver_stamps_ok_on_success(self) -> None:
 		settings = MagicMock()
 		settings.enabled = 1
@@ -339,17 +359,21 @@ class TestCentralReport(IntegrationTestCase):
 		self.assertEqual(count, 2)
 		self.assertEqual(get_all.call_args.kwargs["filters"], {"status": ["in", ["queued"]]})
 		self.assertEqual(get_all.call_args.kwargs["limit"], central_report.MAX_PENDING_RETRY_BATCH)
+		# retry=False: this loop shares one job's timeout across the whole batch,
+		# so each row gets exactly one attempt here — see deliver()'s docstring.
 		deliver.assert_any_call(
 			"cel-1",
 			"vm.status_changed",
 			{"name": "vm-1", "status": "Stopped"},
 			occurred_at="2026-07-06 00:23:05",
+			retry=False,
 		)
 		deliver.assert_any_call(
 			"cel-2",
 			"vm.status_changed",
 			{"name": "vm-2", "status": "Running"},
 			occurred_at="2026-07-06 00:24:00",
+			retry=False,
 		)
 
 	def test_retry_pending_can_replay_legacy_pending_when_explicit(self) -> None:

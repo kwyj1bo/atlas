@@ -206,7 +206,15 @@ def retry_pending(limit: int = 50, include_legacy_pending: bool = False) -> int:
 	if not rows:
 		return 0
 	for row in rows:
-		deliver(row.name, row.event_type, json.loads(row.payload or "{}"), occurred_at=row.occurred_at)
+		# retry=False: this loop shares ONE job's timeout budget across up to
+		# MAX_PENDING_RETRY_BATCH rows (frappe.enqueue's default-queue timeout,
+		# not per-row) — deliver()'s full 7-attempt backoff is sized for a single
+		# freshly-enqueued event with a whole job to itself, and would let one
+		# slow-failing row here burn the entire batch's budget and starve every
+		# row behind it. This cron already reruns every minute forever, so a
+		# failed row still gets retried — just once per minute instead of 7 times
+		# in the same breath, which is what a batch sweep should do anyway.
+		deliver(row.name, row.event_type, json.loads(row.payload or "{}"), occurred_at=row.occurred_at, retry=False)
 	return len(rows)
 
 
@@ -251,18 +259,24 @@ def _write_log(event_type: str, payload: dict, doc=None, occurred_at: str | None
 	)
 
 
-def deliver(log_name: str, event_type: str, payload: dict, occurred_at: str | None = None) -> None:
+def deliver(
+	log_name: str, event_type: str, payload: dict, occurred_at: str | None = None, *, retry: bool = True
+) -> None:
 	"""Background job: POST one event to Central and stamp its Central Event Log
 	row with the outcome. Also updates the single's `status` breadcrumb so the
 	operator sees the last delivery at a glance. Runs only on commit
 	(enqueue_after_commit), so a rolled-back emit's row is never reached here and is
 	stamped `rolled_back` — logged, never delivered.
 
-	Retries a failing POST through DELIVER_BACKOFF_SECONDS (1,2,4,...,64s — 7
-	attempts) before giving up. A row that exhausts every attempt is left
-	status=error with the last failure — that row *is* the dead queue: an
-	operator finds it by filtering Central Event Log on status=error and can
-	replay it (retry_pending's include_legacy_pending, or a direct deliver()
+	When retry=True (the default — a single freshly-emitted event, enqueued as its
+	own job with a whole timeout window to itself), retries a failing POST through
+	DELIVER_BACKOFF_SECONDS (1,2,4,...,64s — 7 attempts) before giving up.
+	retry_pending passes retry=False: it shares one job's timeout across a whole
+	batch of rows, so each gets exactly one attempt there — the batch's own 1-minute
+	cadence is that row's real backoff. Either way, a row that exhausts its
+	attempt(s) is left status=error with the last failure — that row *is* the dead
+	queue: an operator finds it by filtering Central Event Log on status=error and
+	can replay it (retry_pending's include_legacy_pending, or a direct deliver()
 	call) once the underlying issue is fixed."""
 	settings = frappe.get_single("Central Settings")
 	if not settings.enabled:
@@ -275,8 +289,9 @@ def deliver(log_name: str, event_type: str, payload: dict, occurred_at: str | No
 		settings.db_set("status", "skipped: register with Central first", commit=True)
 		return
 
+	backoff = DELIVER_BACKOFF_SECONDS if retry else (0,)
 	last_exception = None
-	for attempt, delay in enumerate(DELIVER_BACKOFF_SECONDS, start=1):
+	for attempt, delay in enumerate(backoff, start=1):
 		try:
 			settings.client().post_event(
 				{
@@ -291,11 +306,11 @@ def deliver(log_name: str, event_type: str, payload: dict, occurred_at: str | No
 			return
 		except CentralError as exception:
 			last_exception = exception
-			if attempt < len(DELIVER_BACKOFF_SECONDS):
+			if attempt < len(backoff):
 				time.sleep(delay)
 
 	frappe.log_error(
-		f"Central event {event_type} failed after {len(DELIVER_BACKOFF_SECONDS)} attempts: {last_exception}",
+		f"Central event {event_type} failed after {len(backoff)} attempt(s): {last_exception}",
 		"Central event",
 	)
 	_stamp(log_name, status="error", last_error=str(last_exception)[:140], http_status=last_exception.status_code)
