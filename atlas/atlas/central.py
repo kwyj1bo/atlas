@@ -84,6 +84,15 @@ class CentralClient:
 		return CentralAuthResult(ok=True, label=body.get("label"))
 
 	def post_event(self, event: dict) -> dict:
+		# webhook_secret is mandatory, not best-effort: an event sent unsigned would
+		# just be bounced by Central's own verify_atlas_signature anyway, so failing
+		# loudly and immediately here — instead of silently POSTing something that
+		# can never succeed — is strictly more honest. Deliberately not a
+		# CentralError: deliver()'s retry loop only catches that, and retrying a
+		# static "not registered" condition 7 times over ~2 minutes of backoff
+		# would just waste the whole window on a problem retrying can't fix.
+		if not self.webhook_secret:
+			frappe.throw("Cannot send an event without webhook_secret — re-register with Central first.")
 		return self._request("POST", "event", json_body=event)
 
 	def _request(self, method: str, route_key: str, json_body: dict | None = None) -> dict:

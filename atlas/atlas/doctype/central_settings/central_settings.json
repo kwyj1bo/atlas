@@ -60,7 +60,9 @@
    "description": "HMAC key we sign outbound event payloads with, so Central can verify the body wasn't altered in transit. Set by provision_tunnel; rotated by re-provisioning.",
    "fieldname": "webhook_secret",
    "fieldtype": "Password",
-   "label": "Webhook Secret"
+   "in_list_view": 1,
+   "label": "Webhook Secret",
+   "reqd": 1
   },
   {
    "fieldname": "column_break_connection",

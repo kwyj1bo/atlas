@@ -33,7 +33,7 @@ def _response(status_code=200, body=None, content=True):
 
 class TestCentralClient(IntegrationTestCase):
 	def setUp(self) -> None:
-		self.client = CentralClient("https://central.example/", "ak", "secret")
+		self.client = CentralClient("https://central.example/", "ak", "secret", webhook_secret="wh_secret")
 
 	def test_request_builds_url_and_auth_header(self) -> None:
 		with patch("atlas.atlas.central.requests.request") as request:
@@ -72,12 +72,18 @@ class TestCentralClient(IntegrationTestCase):
 			with self.assertRaises(CentralError):
 				self.client.post_event({"type": "vm.created"})
 
-	def test_post_event_omits_signature_when_webhook_secret_unset(self) -> None:
-		# self.client was built without a webhook_secret.
+	def test_post_event_refuses_without_webhook_secret(self) -> None:
+		# webhook_secret is mandatory: Central would bounce an unsigned event
+		# anyway, so post_event fails loudly and immediately rather than sending
+		# something that can never succeed — and, critically, before ever making
+		# the HTTP call at all.
+		import frappe
+
+		client = CentralClient("https://central.example/", "ak", "secret")
 		with patch("atlas.atlas.central.requests.request") as request:
-			request.return_value = _response(body={"message": {"ok": True}})
-			self.client.post_event({"type": "vm.created"})
-		self.assertNotIn("X-Central-Signature", request.call_args.kwargs["headers"])
+			with self.assertRaises(frappe.ValidationError):
+				client.post_event({"type": "vm.created"})
+		request.assert_not_called()
 
 	def test_post_event_signs_body_when_webhook_secret_set(self) -> None:
 		import hashlib
