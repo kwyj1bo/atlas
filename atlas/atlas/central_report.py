@@ -28,12 +28,18 @@ the queryable history.
 from __future__ import annotations
 
 import json
+import time
 
 import frappe
 
 from atlas.atlas.central import CentralError
 
 MAX_PENDING_RETRY_BATCH = 100
+
+# Exponential backoff between delivery attempts, seconds: 1, 2, 4, 8, 16, 32, 64 —
+# 7 attempts total (~2 minutes of sleep across all of them) before giving up and
+# leaving the row at status=error for a human to examine and manually retry.
+DELIVER_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 64)
 
 
 def _enabled() -> bool:
@@ -163,7 +169,9 @@ def _enqueue_delivery_after_commit(log_name: str, event_type: str, payload: dict
 	frappe.enqueue(
 		"atlas.atlas.central_report.deliver",
 		queue="default",
-		timeout=60,
+		# Long enough for DELIVER_BACKOFF_SECONDS' full ~2 minutes of sleep plus up
+		# to 7 request attempts, each bounded by CentralClient's own timeout.
+		timeout=300,
 		enqueue_after_commit=True,
 		log_name=log_name,
 		event_type=event_type,
@@ -248,7 +256,14 @@ def deliver(log_name: str, event_type: str, payload: dict, occurred_at: str | No
 	row with the outcome. Also updates the single's `status` breadcrumb so the
 	operator sees the last delivery at a glance. Runs only on commit
 	(enqueue_after_commit), so a rolled-back emit's row is never reached here and is
-	stamped `rolled_back` — logged, never delivered."""
+	stamped `rolled_back` — logged, never delivered.
+
+	Retries a failing POST through DELIVER_BACKOFF_SECONDS (1,2,4,...,64s — 7
+	attempts) before giving up. A row that exhausts every attempt is left
+	status=error with the last failure — that row *is* the dead queue: an
+	operator finds it by filtering Central Event Log on status=error and can
+	replay it (retry_pending's include_legacy_pending, or a direct deliver()
+	call) once the underlying issue is fixed."""
 	settings = frappe.get_single("Central Settings")
 	if not settings.enabled:
 		return
@@ -259,20 +274,32 @@ def deliver(log_name: str, event_type: str, payload: dict, occurred_at: str | No
 		_stamp(log_name, status="skipped")
 		settings.db_set("status", "skipped: register with Central first", commit=True)
 		return
-	try:
-		settings.client().post_event(
-			{
-				"type": event_type,
-				"payload": payload,
-				"occurred_at": _iso(occurred_at) or frappe.utils.now(),
-			}
-		)
-		_stamp(log_name, status="ok", http_status=200)
-		settings.db_set("status", f"ok: {event_type}", commit=True)
-	except CentralError as exception:
-		frappe.log_error(f"Central event {event_type} failed: {exception}", "Central event")
-		_stamp(log_name, status="error", last_error=str(exception)[:140], http_status=exception.status_code)
-		settings.db_set("status", f"error: {exception}"[:140], commit=True)
+
+	last_exception = None
+	for attempt, delay in enumerate(DELIVER_BACKOFF_SECONDS, start=1):
+		try:
+			settings.client().post_event(
+				{
+					"event_id": log_name,
+					"type": event_type,
+					"payload": payload,
+					"occurred_at": _iso(occurred_at) or frappe.utils.now(),
+				}
+			)
+			_stamp(log_name, status="ok", http_status=200)
+			settings.db_set("status", f"ok: {event_type}", commit=True)
+			return
+		except CentralError as exception:
+			last_exception = exception
+			if attempt < len(DELIVER_BACKOFF_SECONDS):
+				time.sleep(delay)
+
+	frappe.log_error(
+		f"Central event {event_type} failed after {len(DELIVER_BACKOFF_SECONDS)} attempts: {last_exception}",
+		"Central event",
+	)
+	_stamp(log_name, status="error", last_error=str(last_exception)[:140], http_status=last_exception.status_code)
+	settings.db_set("status", f"error: {last_exception}"[:140], commit=True)
 
 
 def _set_log_status(log_name: str, status: str) -> None:

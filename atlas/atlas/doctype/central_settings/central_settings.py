@@ -52,4 +52,7 @@ class CentralSettings(Document):
 		if not self.url or not self.api_key:
 			frappe.throw(_("Set Central URL and API Key first"))
 		secret = get_secret("Central Settings", "Central Settings", "api_secret")
-		return CentralClient(self.url, self.api_key, secret)
+		webhook_secret = None
+		if self.webhook_secret:
+			webhook_secret = get_secret("Central Settings", "Central Settings", "webhook_secret")
+		return CentralClient(self.url, self.api_key, secret, webhook_secret=webhook_secret)

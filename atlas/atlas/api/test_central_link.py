@@ -26,6 +26,7 @@ PAYLOAD = {
 	"central_url": "https://central.example",
 	"service_api_key": "svc_key",
 	"service_api_secret": "svc_secret",
+	"webhook_secret": "wh_secret",
 }
 
 TUNNEL_UP_RESULT = {
@@ -99,6 +100,7 @@ class IntegrationTestCentralLink(IntegrationTestCase):
 		self.assertEqual(settings.tunnel_status, "Provisioning")
 		# The pushed service-user secret is stored encrypted, readable back.
 		self.assertEqual(get_secret("Central Settings", "Central Settings", "api_secret"), "svc_secret")
+		self.assertEqual(get_secret("Central Settings", "Central Settings", "webhook_secret"), "wh_secret")
 
 	@patch.object(central_link, "run_local_task")
 	def test_provision_tunnel_passes_keypath_and_tunnel_params(self, run_local_task) -> None:
@@ -135,6 +137,7 @@ class IntegrationTestCentralLink(IntegrationTestCase):
 			central_url="https://central.example",
 			service_api_key="svc_key",
 			service_api_secret="svc_secret",
+			webhook_secret="wh_secret",
 			skip_tunnel=1,
 		)
 

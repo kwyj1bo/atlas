@@ -40,6 +40,7 @@ _REQUIRED = (
 	"central_url",
 	"service_api_key",
 	"service_api_secret",
+	"webhook_secret",
 )
 
 
@@ -106,6 +107,7 @@ def _store_provisioning(payload: dict, result: dict) -> None:
 	settings.url = payload["central_url"]
 	settings.api_key = payload["service_api_key"]
 	settings.api_secret = payload["service_api_secret"]
+	settings.webhook_secret = payload["webhook_secret"]
 	settings.tunnel_ip = payload["tunnel_ip"]
 	settings.tunnel_cidr = payload["tunnel_cidr"]
 	settings.hub_public_key = payload["hub_public_key"]
@@ -124,6 +126,7 @@ def _store_local(payload: dict) -> None:
 	settings.url = payload["central_url"]
 	settings.api_key = payload["service_api_key"]
 	settings.api_secret = payload["service_api_secret"]
+	settings.webhook_secret = payload["webhook_secret"]
 	settings.enabled = 1
 	settings.tunnel_status = "Inactive"
 	settings.save(ignore_permissions=True)

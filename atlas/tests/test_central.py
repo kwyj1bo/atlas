@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import frappe
 from frappe.tests import IntegrationTestCase
@@ -71,6 +71,29 @@ class TestCentralClient(IntegrationTestCase):
 			request.return_value = _response(status_code=500, body={"exc": "boom"})
 			with self.assertRaises(CentralError):
 				self.client.post_event({"type": "vm.created"})
+
+	def test_post_event_omits_signature_when_webhook_secret_unset(self) -> None:
+		# self.client was built without a webhook_secret.
+		with patch("atlas.atlas.central.requests.request") as request:
+			request.return_value = _response(body={"message": {"ok": True}})
+			self.client.post_event({"type": "vm.created"})
+		self.assertNotIn("X-Central-Signature", request.call_args.kwargs["headers"])
+
+	def test_post_event_signs_body_when_webhook_secret_set(self) -> None:
+		import hashlib
+		import hmac
+
+		client = CentralClient("https://central.example/", "ak", "secret", webhook_secret="wh_secret")
+		with patch("atlas.atlas.central.requests.request") as request:
+			request.return_value = _response(body={"message": {"ok": True}})
+			client.post_event({"type": "vm.created"})
+
+		kwargs = request.call_args.kwargs
+		sent_body = kwargs["data"]
+		expected = hmac.new(b"wh_secret", sent_body, hashlib.sha256).hexdigest()
+		self.assertEqual(kwargs["headers"]["X-Central-Signature"], expected)
+		# Signed over the exact bytes sent, not a re-serialization of the dict.
+		self.assertEqual(json.loads(sent_body), {"type": "vm.created"})
 
 
 @contextlib.contextmanager
@@ -232,14 +255,19 @@ class TestCentralReport(IntegrationTestCase):
 			patch.object(central_report.frappe, "get_single", return_value=settings),
 			patch.object(central_report, "_stamp") as stamp,
 			patch.object(central_report.frappe, "log_error"),
+			patch.object(central_report.time, "sleep") as sleep,
 		):
 			central_report.deliver("cel-1", "vm.created", {"name": "vm-1"})
+		# Retried through the full backoff schedule before giving up.
+		self.assertEqual(settings.client.return_value.post_event.call_count, 7)
+		self.assertEqual(sleep.call_count, 6)
+		sleep.assert_has_calls([call(s) for s in (1, 2, 4, 8, 16, 32)])
 		# The single's breadcrumb still records the error...
 		settings.db_set.assert_called()
 		recorded = settings.db_set.call_args[0]
 		self.assertEqual(recorded[0], "status")
 		self.assertIn("error", recorded[1])
-		# ...and the audit row is stamped error with the HTTP status from Central.
+		# ...and the audit row is stamped error, once, with the last attempt's HTTP status.
 		stamp.assert_called_once()
 		self.assertEqual(stamp.call_args[0][0], "cel-1")
 		self.assertEqual(stamp.call_args.kwargs["status"], "error")
@@ -257,6 +285,28 @@ class TestCentralReport(IntegrationTestCase):
 		settings.client.return_value.post_event.assert_called_once()
 		event = settings.client.return_value.post_event.call_args[0][0]
 		self.assertEqual(event["occurred_at"], "2026-07-06 00:23:05")
+		stamp.assert_called_once_with("cel-1", status="ok", http_status=200)
+
+	def test_deliver_retries_with_backoff_then_succeeds(self) -> None:
+		settings = MagicMock()
+		settings.enabled = 1
+		settings.api_key = "svc_key"
+		settings.client.return_value.post_event.side_effect = [
+			CentralError("boom-1", 503),
+			CentralError("boom-2", 503),
+			None,
+		]
+		with (
+			patch.object(central_report.frappe, "get_single", return_value=settings),
+			patch.object(central_report, "_stamp") as stamp,
+			patch.object(central_report.time, "sleep") as sleep,
+		):
+			central_report.deliver("cel-1", "vm.created", {"name": "vm-1"})
+		self.assertEqual(settings.client.return_value.post_event.call_count, 3)
+		# Only the two waits between the two failures and the eventual success —
+		# no sleep after the run stops.
+		sleep.assert_has_calls([call(1), call(2)])
+		self.assertEqual(sleep.call_count, 2)
 		stamp.assert_called_once_with("cel-1", status="ok", http_status=200)
 
 	def test_retry_pending_replays_queued_events_in_order(self) -> None:

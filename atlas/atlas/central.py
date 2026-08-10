@@ -25,6 +25,9 @@ contract is absorbed here, so a change on Central's side is a one-file edit.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
+import json as json_lib
 
 import frappe
 import requests
@@ -57,10 +60,18 @@ class CentralAuthResult:
 class CentralClient:
 	"""Talks to a single Central instance. Constructed from Central Settings."""
 
-	def __init__(self, url: str, api_key: str, api_secret: str, timeout: int = DEFAULT_TIMEOUT):
+	def __init__(
+		self,
+		url: str,
+		api_key: str,
+		api_secret: str,
+		webhook_secret: str | None = None,
+		timeout: int = DEFAULT_TIMEOUT,
+	):
 		self.url = url.rstrip("/")
 		self.api_key = api_key
 		self.api_secret = api_secret
+		self.webhook_secret = webhook_secret
 		self.timeout = timeout
 
 	def ping(self) -> CentralAuthResult:
@@ -73,17 +84,26 @@ class CentralClient:
 		return CentralAuthResult(ok=True, label=body.get("label"))
 
 	def post_event(self, event: dict) -> dict:
-		return self._request("POST", "event", json=event)
+		return self._request("POST", "event", json_body=event)
 
-	def _request(self, method: str, route_key: str, json: dict | None = None) -> dict:
+	def _request(self, method: str, route_key: str, json_body: dict | None = None) -> dict:
 		url = f"{self.url}/api/method/{_ROUTES[route_key]}"
 		headers = {
 			"Authorization": f"token {self.api_key}:{self.api_secret}",
 			"Content-Type": "application/json",
 			"Accept": "application/json",
 		}
+		# Sign the exact bytes we send (not a re-serialization of them) so the
+		# receiver's HMAC over the raw body it read is guaranteed to match ours.
+		data = None
+		if json_body is not None:
+			data = json_lib.dumps(json_body).encode()
+			if self.webhook_secret:
+				headers["X-Central-Signature"] = hmac.new(
+					self.webhook_secret.encode(), data, hashlib.sha256
+				).hexdigest()
 		try:
-			response = requests.request(method, url, json=json, headers=headers, timeout=self.timeout)
+			response = requests.request(method, url, data=data, headers=headers, timeout=self.timeout)
 		except requests.RequestException as exception:
 			raise CentralError(f"{method} {route_key}: {exception}") from exception
 		if response.status_code >= 400:
